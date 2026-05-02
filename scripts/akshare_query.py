@@ -617,7 +617,7 @@ def analyze_stock(stock_code):
             import akshare as ak
             items = []
             try:
-                dn = ak.stock_news_em(symbol=f"{_MARKET}.{stock_code}")
+                dn = ak.stock_news_em(symbol=stock_code)
                 for i in range(min(10, len(dn))):
                     row = dn.iloc[i]
                     items.append({'source': '东财', 'title': str(row.iloc[1]) if len(row)>1 else '',
@@ -635,7 +635,7 @@ def analyze_stock(stock_code):
     # --- 4. Northbound ---
     try:
         import akshare as ak
-        nb = ak.stock_hsgt_individual_em(symbol=f"{_MARKET}.{stock_code}")
+        nb = ak.stock_hsgt_individual_em(symbol=stock_code)
         if nb is not None and len(nb) > 0:
             nb = nb.sort_values(nb.columns[0])
             nb_tail = nb.tail(20)
@@ -713,7 +713,7 @@ def analyze_stock(stock_code):
     # --- 7. Analyst ---
     try:
         import akshare as ak
-        rp = ak.stock_research_report_em(symbol=f"{_MARKET}.{stock_code}")
+        rp = ak.stock_research_report_em(symbol=stock_code)
         if rp is not None and len(rp) > 0:
             rp_items = []; rating_changes = {'上调': 0, '下调': 0, '维持': 0}
             for i in range(min(12, len(rp))):
