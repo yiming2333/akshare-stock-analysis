@@ -1,2 +1,3 @@
 ﻿.cache
 scripts/__pycache__/
+snapshots.db
