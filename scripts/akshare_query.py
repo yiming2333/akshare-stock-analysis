@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-StockDeepScan v8 — optimized version.
-v8 changes: signals + risk_warnings replace subjective suggestions,
-           backtest mode, valuation module, event alerts,
-           trend persistence (SQLite), batch analysis,
-           volatility/VaR, retry mechanism, cache layering.
+StockDeepScan v8.1 — bugfix & robust version.
+v8.1 changes: fix NameError on TDX failure, div-zero protections,
+              NaN-safe JSON, robust cache handling, backtest bounds.
 Usage: python akshare_query.py <stock_code> [--backtest] [--batch <file>] [--trend] [--quick]
 """
 
@@ -33,12 +31,20 @@ QUICK_MODE = '--quick' in sys.argv
 OUTPUT_FILE = None
 BATCH_FILE = None
 BACKTEST_RULES = 'macd_golden'
+
+# Parse args allowing both "--batch file" and "--batch=file"
 for i, a in enumerate(sys.argv):
-    if a == '--output' and i + 1 < len(sys.argv):
-        OUTPUT_FILE = sys.argv[i + 1]
-    if a == '--batch' and i + 1 < len(sys.argv):
+    if a.startswith('--batch='):
+        BATCH_FILE = a.split('=', 1)[1]
+    elif a == '--batch' and i + 1 < len(sys.argv):
         BATCH_FILE = sys.argv[i + 1]
-    if a == '--rules' and i + 1 < len(sys.argv):
+    if a.startswith('--output='):
+        OUTPUT_FILE = a.split('=', 1)[1]
+    elif a == '--output' and i + 1 < len(sys.argv):
+        OUTPUT_FILE = sys.argv[i + 1]
+    if a.startswith('--rules='):
+        BACKTEST_RULES = a.split('=', 1)[1]
+    elif a == '--rules' and i + 1 < len(sys.argv):
         BACKTEST_RULES = sys.argv[i + 1]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -135,6 +141,20 @@ def detect_market(code):
     sina_p = 'sz' if m == 'sz' else 'sh'
     return m, tdx_m, sina_p
 
+# NaN-safe recursive cleaner (converts NaN -> None, clears -0.0)
+def clean_output(v):
+    if isinstance(v, float):
+        if v != v:          # NaN
+            return None
+        if v == 0:
+            return 0.0
+        return v
+    if isinstance(v, dict):
+        return {k: clean_output(v2) for k, v2 in v.items()}
+    if isinstance(v, list):
+        return [clean_output(x) for x in v]
+    return v
+
 # ======== PEER GROUPS ========
 PEER_GROUPS = {
     '稀土永磁': ['600111','000831','600392','600259','000970','600549','300748','300224'],
@@ -155,25 +175,30 @@ def analyze_stock(stock_code):
     _MARKET, _TDX_MARKET, _SINA_PREFIX = detect_market(stock_code)
     result = {"stock": stock_code, "status": "ok", "sections": {}}
 
-    # --- 0. pytdx ---
+    # --- 0. pytdx (robust scope) ---
+    raw_ts = 0; raw_nc = 0
     try:
         api = TdxHq_API()
         if api.connect('180.153.18.170', 7709):
-            fin = api.get_finance_info(_TDX_MARKET, stock_code)
-            api.disconnect()
-            raw_ts = fin.get('zongguben', 0)
-            raw_nc = fin.get('jingzichan', 0)
-            result['sections']['capital'] = {
-                'total_shares': raw_ts,
-                'total_shares_yi': round(raw_ts / 1e8, 2) if raw_ts > 1e8 else (raw_ts if raw_ts > 1 else 0),
-                'float_shares': fin.get('liutongguben', 0),
-                'total_assets': fin.get('zongzichan', 0),
-                'net_assets': raw_nc,
-                'net_assets_yi': round(raw_nc / 1e8, 2) if raw_nc > 1e8 else 0,
-                'bvps': fin.get('meigujingzichan', 0),
-                'revenue_ttm': fin.get('zhuyingshouru', 0),
-                'net_profit_ttm': fin.get('jinglirun', 0),
-            }
+            try:
+                fin = api.get_finance_info(_TDX_MARKET, stock_code)
+                raw_ts = fin.get('zongguben', 0) or 0
+                raw_nc = fin.get('jingzichan', 0) or 0
+                result['sections']['capital'] = {
+                    'total_shares': raw_ts,
+                    'total_shares_yi': round(raw_ts / 1e8, 2) if raw_ts > 1e8 else (raw_ts if raw_ts > 1 else 0),
+                    'float_shares': fin.get('liutongguben', 0),
+                    'total_assets': fin.get('zongzichan', 0),
+                    'net_assets': raw_nc,
+                    'net_assets_yi': round(raw_nc / 1e8, 2) if raw_nc > 1e8 else 0,
+                    'bvps': fin.get('meigujingzichan', 0),
+                    'revenue_ttm': fin.get('zhuyingshouru', 0),
+                    'net_profit_ttm': fin.get('jinglirun', 0),
+                }
+            finally:
+                api.disconnect()
+        else:
+            result['sections']['capital'] = {"error": "TDX connect failed"}
     except Exception as e:
         result['sections']['capital'] = {"error": str(e)}
 
@@ -211,9 +236,8 @@ def analyze_stock(stock_code):
 
         ck = cache_key('kl', stock_code)
         cached_kl = cache_get(ck, 30)
-        if cached_kl:
+        if cached_kl and len(cached_kl) > 0:
             df = pd.DataFrame(cached_kl)
-            rows_count = len(df)
         else:
             rs = bs.query_history_k_data_plus(
                 f'{_MARKET}.{stock_code}',
@@ -228,7 +252,6 @@ def analyze_stock(stock_code):
             for c in ['open','high','low','close','volume','amount','turn','pctChg','peTTM','pbMRQ']:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
             df = df.dropna(subset=['close']).reset_index(drop=True)
-            rows_count = len(rows)
             cache_set(ck, df.to_dict(orient='records'))
 
         # Profit
@@ -318,7 +341,6 @@ def analyze_stock(stock_code):
                                     'eps': round(safe_num(row[7]), 3),
                                     'revenue_yi': round(safe_num(row[8])/1e8, 2),
                                 }); break
-                            # Peer PE/PB for valuation
                             try:
                                 rk = bs.query_history_k_data_plus(
                                     f'{pm}.{peer_code}', 'date,close,peTTM,pbMRQ',
@@ -374,17 +396,18 @@ def analyze_stock(stock_code):
                     else: beta_label = '低波动'
         except Exception: pass
         result['sections']['beta'] = {'value': beta_val, 'label': beta_label}
-        bs.logout()
 
-        # Derive mktcap
-        cap = result['sections']['capital']
+        # Derive mktcap safely
+        cap = result['sections'].get('capital', {})
         sr = result['sections']
         if sr.get('sina_realtime', {}).get('price'):
             px = sr['sina_realtime']['price']
-            cap['mktcap_yi'] = round(raw_ts * px / 1e8, 2)
+            ts = cap.get('total_shares', raw_ts) if cap.get('total_shares') else raw_ts
+            if ts:
+                cap['mktcap_yi'] = round(ts * px / 1e8, 2)
 
         result['sections']['history'] = {
-            'rows': rows_count, 'start': str(df['date'].iloc[0]), 'end': str(df['date'].iloc[-1]),
+            'rows': len(df), 'start': str(df['date'].iloc[0]), 'end': str(df['date'].iloc[-1]),
             'latest': {
                 'date': str(df['date'].iloc[-1]), 'close': float(df['close'].iloc[-1]),
                 'pctChg': float(df['pctChg'].iloc[-1]), 'volume': float(df['volume'].iloc[-1]),
@@ -440,7 +463,7 @@ def analyze_stock(stock_code):
             elif pb_pct_val >= 20: f['pb_hist_verdict'] = '偏低水平'
             else: f['pb_hist_verdict'] = '历史低位区'
 
-        # === TECHNICAL INDICATORS ===
+        # === TECHNICAL INDICATORS (div-zero protected) ===
         close = df['close']; high = df['high']; low = df['low']; vol = df['volume']
         for n in [5,10,20,30,60,120]:
             df[f'MA{n}'] = close.rolling(n).mean()
@@ -448,14 +471,23 @@ def analyze_stock(stock_code):
         df['DIF']=e1-e2; df['DEA']=df['DIF'].ewm(span=5,adjust=False).mean()
         df['MACDH']=2*(df['DIF']-df['DEA'])
         L=low.rolling(6,min_periods=6).min(); H=high.rolling(6,min_periods=6).max()
-        rsv=(close-L)/(H-L)*100
-        df['K']=rsv.ewm(com=2,adjust=False).mean(); df['D']=df['K'].ewm(com=2,adjust=False).mean()
+        h_l = H - L
+        # KDJ RSV: protect against H==L (give 50 as neutral)
+        rsv = np.where(h_l > 0, (close - L) / h_l * 100, 50.0)
+        df['K']=pd.Series(rsv).ewm(com=2,adjust=False).mean()
+        df['D']=df['K'].ewm(com=2,adjust=False).mean()
         df['J']=3*df['K']-2*df['D']
         for n in [6,12,24]:
-            d=close.diff(); g_=d.where(d>0,0).rolling(n).mean(); l__=(-d.where(d<0,0)).rolling(n).mean()
-            rs_=g_/l__; df[f'RSI{n}']=100-100/(1+rs_)
+            d=close.diff()
+            g_=d.where(d>0,0).rolling(n).mean()
+            l__=(-d.where(d<0,0)).rolling(n).mean()
+            l_safe = l__.replace(0, np.nan)
+            rs_=g_/l_safe
+            df[f'RSI{n}']=100-100/(1+rs_)
+            df[f'RSI{n}'] = df[f'RSI{n}'].fillna(50)   # neutral where denominator zero
         h10=high.rolling(10,min_periods=10).max(); l10=low.rolling(10,min_periods=10).min()
-        df['WR']=(h10-close)/(h10-l10)*100
+        wr_den = h10 - l10
+        df['WR'] = np.where(wr_den > 0, (h10-close)/wr_den*100, 50.0)
         df['B_MID']=close.rolling(20).mean(); s2=close.rolling(20).std()
         df['B_UP']=df['B_MID']+2*s2; df['B_DN']=df['B_MID']-2*s2
         df['VMA5']=vol.rolling(5).mean(); df['VRATIO']=vol/df['VMA5']
@@ -473,7 +505,7 @@ def analyze_stock(stock_code):
         last = df.iloc[-1]; c_now = last['close']
         mas = {}
         for n in [5,10,20,30,60,120]:
-            mv = last[f'MA{n}']; mas[f'MA{n}'] = {'value': float(mv), 'relation': 'above' if c_now > mv else 'below'}
+            mv = last[f'MA{n}']; mas[f'MA{n}'] = {'value': None if pd.isna(mv) else float(mv), 'relation': 'above' if (not pd.isna(mv) and c_now > mv) else 'below'}
         bc = sum(1 for m in mas.values() if m['relation'] == 'above')
 
         result['sections']['technical'] = {
@@ -486,11 +518,12 @@ def analyze_stock(stock_code):
             'wr': {'value': float(last['WR']),
                    'status': 'overbought' if last['WR']<20 else ('oversold' if last['WR']>80 else 'neutral')},
             'boll': {'upper': float(last['B_UP']), 'mid': float(last['B_MID']), 'lower': float(last['B_DN']),
-                     'position_pct': float((c_now - last['B_DN']) / (last['B_UP'] - last['B_DN']) * 100),
-                     'width_pct': float((last['B_UP'] - last['B_DN']) / last['B_MID'] * 100)},
-            'adx': {'adx': round(float(last['ADX']), 1), 'pdi': round(float(last['PDI']), 1),
-                    'mdi': round(float(last['MDI']), 1),
-                    'trend_strength': 'strong' if last['ADX'] > 25 else ('weak' if last['ADX'] < 20 else 'moderate'),
+                     'position_pct': float((c_now - last['B_DN']) / (last['B_UP'] - last['B_DN']) * 100) if (last['B_UP'] != last['B_DN']) else 50,
+                     'width_pct': float((last['B_UP'] - last['B_DN']) / last['B_MID'] * 100) if last['B_MID'] != 0 else 0},
+            'adx': {'adx': None if pd.isna(last['ADX']) else round(float(last['ADX']), 1),
+                    'pdi': None if pd.isna(last['PDI']) else round(float(last['PDI']), 1),
+                    'mdi': None if pd.isna(last['MDI']) else round(float(last['MDI']), 1),
+                    'trend_strength': 'weak' if pd.isna(last['ADX']) or last['ADX'] < 20 else ('strong' if last['ADX'] > 25 else 'moderate'),
                     'direction': 'bullish' if last['PDI'] > last['MDI'] else 'bearish'},
             'atr': {'value': round(float(last['ATR14']), 2),
                     'pct_of_price': round(float(last['ATR14'] / c_now * 100), 2),
@@ -536,6 +569,7 @@ def analyze_stock(stock_code):
                 'max_drawdown_1y_pct': max_dd_1y,
                 'max_drawdown_verdict': dd_v}
 
+        bs.logout()
     except Exception as e:
         result['sections']['history'] = {"error": str(e)}
         df = None
@@ -835,10 +869,10 @@ def analyze_stock(stock_code):
     elif r6 < 20: signals.append({'category':'technical','signal':'RSI超卖(反弹可能)','strength':'reversal'})
 
     bp2 = t.get('boll',{}).get('position_pct', 50)
-    if bp2 > 95: signals.append({'category':'technical','signal':'BOLL上轨突破','strength':'breakout'})
-    elif bp2 < 5: signals.append({'category':'technical','signal':'BOLL下轨超卖','strength':'oversold'})
+    if bp2 is not None:
+        if bp2 > 95: signals.append({'category':'technical','signal':'BOLL上轨突破','strength':'breakout'})
+        elif bp2 < 5: signals.append({'category':'technical','signal':'BOLL下轨超卖','strength':'oversold'})
 
-    # Fund flow signals
     if 'fund_flow' in s and s['fund_flow'].get('recent_10d'):
         f10 = s['fund_flow']['recent_10d']
         if len(f10) >= 5:
@@ -851,21 +885,20 @@ def analyze_stock(stock_code):
                 signals.append({'category':'fund_flow','signal':f'主力连续5日净流出({tot:.2f}亿)','strength':'bearish'})
             l3 = f10[-3:]
             if all(x['main_net_yi'] > 0 for x in l3):
-                pc2 = (l3[-1]['close']-l3[0]['close'])/l3[0]['close']
+                pc2 = (l3[-1]['close']-l3[0]['close'])/l3[0]['close'] if l3[0]['close']!=0 else 0
                 if pc2 < 0: signals.append({'category':'smart_money','signal':'聪明钱底背离(主力买+股价跌)','strength':'bullish_divergence'})
 
-    # Northbound
     if 'northbound' in s and s['northbound'].get('last5d_net_yi'):
         n5 = s['northbound']['last5d_net_yi']
         if n5 > 5: signals.append({'category':'northbound','signal':'北向5日大幅流入','strength':'strong'})
         elif n5 < -5: signals.append({'category':'northbound','signal':'北向5日大幅流出','strength':'bearish'})
 
-    # Fundamental
     if f.get('roe',0) > 0.15: signals.append({'category':'fundamental','signal':f'ROE优秀({f["roe"]*100:.1f}%)','strength':'strong'})
     if g > 0.5: signals.append({'category':'fundamental','signal':f'净利高增长({g*100:.0f}%YoY)','strength':'strong'})
     elif g > 0.2: signals.append({'category':'fundamental','signal':f'净利较快增长({g*100:.0f}%YoY)','strength':'moderate'})
-    if peg and peg < 0.5: signals.append({'category':'fundamental','signal':f'PEG={peg:.2f}深度低估','strength':'strong'})
-    elif peg and peg < 1.0: signals.append({'category':'fundamental','signal':f'PEG={peg:.2f}估值偏低','strength':'moderate'})
+    if peg is not None:
+        if peg < 0.5: signals.append({'category':'fundamental','signal':f'PEG={peg:.2f}深度低估','strength':'strong'})
+        elif peg < 1.0: signals.append({'category':'fundamental','signal':f'PEG={peg:.2f}估值偏低','strength':'moderate'})
     if pct is not None:
         if pct < 20: signals.append({'category':'valuation','signal':f'PE历史{pct}%分位(低位)','strength':'strong'})
         elif pct > 90: signals.append({'category':'valuation','signal':f'PE历史{pct}%分位(极高位)','strength':'warning'})
@@ -886,7 +919,7 @@ def analyze_stock(stock_code):
     if pct and pct > 90:
         risk_warnings.append({'category':'valuation_peak','severity':'high',
             'detail': f"PE{pct}%历史分位—均值回归风险"})
-    if peg and peg > 3:
+    if peg is not None and peg > 3:
         risk_warnings.append({'category':'peg_overvalued','severity':'high',
             'detail': f"PEG={peg:.1f}(>3)估值严重偏离增长"})
     if f.get('cash_quality') == 'weak':
@@ -935,7 +968,6 @@ def analyze_stock(stock_code):
         rel['pb_peer_median'] = round(pbmed, 2); rel['pb_peer_pct'] = ppct2
         if fpb: rel['fair_price_pb'] = fpb; rel['price_to_fair_pb'] = round(cpx/fpb, 2) if fpb > 0 else None
 
-    # Weighted fair value
     fvals = [v for v in [rel.get('fair_price_pe'), rel.get('fair_price_pb')] if v]
     if fvals:
         fv = round(np.mean(fvals), 2); rel['fair_value_weighted'] = fv
@@ -988,14 +1020,13 @@ def analyze_stock(stock_code):
     elif yoy > 0.1: fc['long'] = {'direction':'neutral_bullish','summary':'盈利改善中'}
     else: fc['long'] = {'direction':'neutral','summary':'等待盈利确认'}
 
-    # Key levels
     kl = {}
     if cpx: kl['current'] = round(cpx, 2)
     if 'technical' in s:
         t = s['technical']
         kl['resistance_boll_upper'] = round(t['boll']['upper'], 2)
         for n in ['MA60','MA20']:
-            if n in t['ma_system']['lines']: kl[f'support_{n}'] = round(t['ma_system']['lines'][n]['value'], 2)
+            if n in t['ma_system']['lines']: kl[f'support_{n}'] = round(t['ma_system']['lines'][n]['value'], 2) if t['ma_system']['lines'][n]['value'] is not None else None
         kl['support_boll_lower'] = round(t['boll']['lower'], 2)
 
     result['sections']['assessment'] = {
@@ -1025,7 +1056,7 @@ def analyze_stock(stock_code):
 
     return result
 
-# ======== BACKTEST MODE ========
+# ======== BACKTEST MODE (with bounds check) ========
 def run_backtest(stock_code):
     _MARKET, _, _ = detect_market(stock_code)
     bs.login()
@@ -1050,9 +1081,15 @@ def run_backtest(stock_code):
     df['DIF']=e1-e2; df['DEA']=df['DIF'].ewm(span=5,adjust=False).mean()
     df['MACDH']=2*(df['DIF']-df['DEA'])
     for n in [6,12]:
-        d=close.diff(); g_=d.where(d>0,0).rolling(n).mean(); l__=(-d.where(d<0,0)).rolling(n).mean()
-        rs_=g_/l__; df[f'RSI{n}']=100-100/(1+rs_)
-    df = df.dropna().reset_index(drop=True)
+        d=close.diff(); g_=d.where(d>0,0).rolling(n).mean()
+        l__=(-d.where(d<0,0)).rolling(n).mean()
+        l_safe = l__.replace(0, np.nan)
+        rs_=g_/l_safe
+        df[f'RSI{n}']=100-100/(1+rs_)
+        df[f'RSI{n}'] = df[f'RSI{n}'].fillna(50)
+    df = df.dropna(subset=['DIF','DEA','MACDH']).reset_index(drop=True)  # keep only valid rows
+    if len(df) < 61:
+        return {'error': f'有效信号窗口不足(需至少61条, 实际{len(df)})'}
 
     trades = []; holding = False; entry_price = 0; entry_date = ''
     hold_days = 5; hold_counter = 0
@@ -1133,12 +1170,8 @@ if __name__ == '__main__':
 
     elif STOCK:
         result = analyze_stock(STOCK)
-        def clean_neg(v):
-            if isinstance(v, float): return v if v != 0 else 0.0
-            if isinstance(v, dict): return {k: clean_neg(v2) for k,v2 in v.items()}
-            if isinstance(v, list): return [clean_neg(x) for x in v]
-            return v
-        result = clean_neg(result)
+        # Apply NaN cleaner
+        result = clean_output(result)
         output = json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if OUTPUT_FILE:
             with open(OUTPUT_FILE, 'w', encoding='utf-8') as f: f.write(output)
