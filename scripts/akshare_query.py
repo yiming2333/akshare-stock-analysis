@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-StockDeepScan v9.0 — fully refactored.
-v9.0 changes:
+StockDeepScan v3.0.0 — fully refactored.
+v3.0.0 changes:
   - Fix: unreachable except in News (Bug #1)
   - Fix: trend key collision 5d/10d both 'short' (Bug #2)
   - Fix: implement --quick mode (Bug #3)

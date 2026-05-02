@@ -1,8 +1,9 @@
-# AKShare Stock Analysis Skill — v2.0.0
+# AKShare Stock Analysis Skill — v3.0.0
 
 ## 版本历史
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v3.0.0 | 2026-05-02 | **架构重构+Bug修复**: ① 修复News不可达异常 ② 修复趋势5d/10d key冲突 ③ 实现--quick模式 ④ --rules参数生效+RSI回测策略 ⑤ 修复margin变量遮蔽 ⑥ 动态日期。**架构**: 模块化拆分(20+函数)、技术指标公共函数、Config类替代全局变量、logging日志、SQLite上下文管理器、输入校验、__name__保护 |
 | v2.0.0 | 2026-05-02 | **重大重构**: ① 移除主观trade_suggestion→客观signals+risk_warnings ② 新增--backtest回测模式 ③ 新增估值定价模块(相对估值+简易DCF) ④ 新增波动率/VaR风险度量 ⑤ 数据持久化(SQLite)+--trend趋势输出 ⑥ --batch批量分析 ⑦ 重试机制+缓存分层 ⑧ 事件预警增强 |
 | v1.2.0 | 2026-05-01 | 7项Bug修复: 新浪PE/PB/Peer分组/Capital转亿/PEG基数保护等 |
 | v1.1.2 | 2026-05-01 | 三个Bug修复: PEG EPS口径/Peer fallback/资金流向字段补齐 |
@@ -21,7 +22,46 @@
 | 资金面 | AKShare (东财dataCenter) | 日频主力/超大单/大单/中单/小单净流入、北向资金、融资融券、股东户数 |
 | 技术面 | Baostock历史K线 + 内置计算 | MA(5/10/20/30/60/120)、MACD(6,13,5)、KDJ(6,3,3)、RSI(6/12/24)、WR(10)、BOLL(20,2)、ADX(14)、ATR(14)、量价关系、多周期趋势 |
 
-## 新增功能 (v2.0)
+## v3.0 架构改进
+
+### 代码结构 (20+ 独立函数)
+```
+fetch_capital()        ← pytdx 股本/资产
+fetch_realtime()       ← 新浪实时行情
+fetch_kline()          ← Baostock K线(带缓存)
+fetch_fundamentals()   ← 利润/增长/现金流/Q1 YoY
+fetch_peers()          ← 同行对比(24h缓存)
+fetch_beta()           ← Beta vs 沪深300
+fetch_fund_flow()      ← AKShare 资金流(带重试)
+fetch_news()           ← 东财新闻
+fetch_northbound()     ← 北向资金
+fetch_margin()         ← 融资融券
+fetch_shareholders()   ← 股东户数
+fetch_analyst()        ← 研报评级
+fetch_lockup()         ← 解禁预警
+calc_all_indicators()  ← 技术指标计算
+calc_signals()         ← 客观信号提取
+calc_risk_warnings()   ← 风险预警提取
+calc_scoring()         ← 综合评分
+build_valuation()      ← 估值(相对+DCF)
+build_forecast()       ← 三周期预测
+build_key_levels()     ← 关键价位
+```
+
+### 技术指标公共函数
+```python
+calc_ma(df, periods)      # 简单移动平均
+calc_macd(df, fast, slow, signal)  # MACD
+calc_kdj(df, n, m1, m2)   # KDJ
+calc_rsi(df, periods)      # RSI 多周期
+calc_wr(df, n)             # Williams %R
+calc_boll(df, n, k)        # 布林带
+calc_atr(df, n)            # 平均真实波幅
+calc_adx(df, n)            # ADX/+DI/-DI
+calc_volume(df)            # 量比
+```
+
+## 新增功能 (v2.0+)
 
 ### 客观信号 (signals)
 替代原主观 trade_suggestion，输出客观触发的技术/资金/基本面信号：
@@ -41,10 +81,15 @@
 
 ### 回测模式 (--backtest)
 ```bash
+# MACD金叉策略(默认)
 python scripts/akshare_query.py 600111 --backtest
+
+# RSI超卖反弹策略(v3.0新增)
+python scripts/akshare_query.py 600111 --backtest --rules=rsi_oversold
 ```
-按MACD金叉买入、持5日卖出、-8%止损的规则，对过去1-3年历史数据回测。
-输出: 累计收益率、胜率、最大回撤、夏普比率、具体交易记录。
+- MACD策略: 金叉买入、持5日卖出、-8%止损
+- RSI策略: RSI6<25买入、持3日卖出、-5%止损
+- 输出: 累计收益率、胜率、最大回撤、夏普比率、具体交易记录。
 
 ### 估值定价模块
 - **相对估值**: 基于同行业PE/PB中位数，计算当前股价的低估/合理/高估区间
@@ -84,7 +129,13 @@ python scripts/akshare_query.py 600111 --trend
 ```bash
 python scripts/akshare_query.py --batch stocks.csv
 ```
-一次性分析多只股票，输出汇总对比表。
+一次性分析多只股票，输出汇总对比表。v3.0新增：自动校验股票代码格式、每只股票间隔1秒防限流。
+
+### 快速模式 (--quick)
+```bash
+python scripts/akshare_query.py 600111 --quick
+```
+跳过 news/northbound/margin/shareholders/analyst/lockup，减少API调用，加速输出。
 
 ### 重试机制
 - 所有AKShare调用内置指数退避重试(3次, 1s/2s/4s)
@@ -96,11 +147,14 @@ python scripts/akshare_query.py --batch stocks.csv
 # 标准诊断
 python scripts/akshare_query.py 600111
 
-# 快速模式 (跳过新闻/资金流/北向 — 减少API调用)
+# 快速模式 (跳过新闻/北向/融资/股东/研报/解禁)
 python scripts/akshare_query.py 600111 --quick
 
-# 回测验证
+# 回测验证 (MACD策略)
 python scripts/akshare_query.py 600111 --backtest
+
+# 回测验证 (RSI策略)
+python scripts/akshare_query.py 600111 --backtest --rules=rsi_oversold
 
 # 批量分析
 python scripts/akshare_query.py --batch stocks.csv
@@ -110,6 +164,10 @@ python scripts/akshare_query.py 600111 --trend
 
 # JSON输出到文件
 python scripts/akshare_query.py 600111 --output result.json
+
+# 跳过特定数据源
+python scripts/akshare_query.py 600111 --no-fund-flow
+python scripts/akshare_query.py 600111 --no-news
 ```
 
 ## Complete Workflow
@@ -137,10 +195,10 @@ JSON 包含以下 sections:
   "shareholders":  {股东户数},
   "analyst":       {研报追踪/评级变动},
   "lockup":        {解禁预警},
-  "signals":       {客观信号数组 ✨NEW},
-  "risk_warnings": {风险预警数组 ✨NEW},
-  "valuation":     {相对估值+DCF ✨NEW},
-  "risk_metrics":  {波动率/VaR/最大回撤 ✨NEW},
+  "signals":       {客观信号数组},
+  "risk_warnings": {风险预警数组},
+  "valuation":     {相对估值+DCF},
+  "risk_metrics":  {波动率/VaR/最大回撤},
   "assessment":    {评分, 预测, 关键价位}
 }
 ```
@@ -213,3 +271,4 @@ pip install baostock pytdx akshare pandas numpy requests
 - 本技能不提供投资建议，所有信号和预测均为基于公开数据的客观分析
 - DCF估值基于经营现金流估算，仅供参考，实际价值受多重因素影响
 - 简易DCF使用固定WACC=10%、永续增长率=3%，精确度有限
+- v3.0起K线/融资/股东查询使用动态日期，不再硬编码截止日期
